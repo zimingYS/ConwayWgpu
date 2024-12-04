@@ -5,6 +5,8 @@
 ////如果此项目涉及侵权，请联系作者或在讨论中提出
 ////仅作学习探讨使用
 
+use std::thread;
+use std::time::{Duration, Instant};
 use cgmath::{InnerSpace, Rotation3, Zero};
 use winit::{
     event::*,
@@ -144,6 +146,12 @@ struct State{
     //实例化
     instances: Vec<Instance>,
     instance_buffer: Buffer,
+    //游戏状态更新
+    board: Vec<Vec<bool>>,
+    //更新延时
+    last_update: Instant,
+    //控制设置
+    mouse_position: Option<winit::dpi::PhysicalPosition<f64>>,
 }
 //用于处理一些操作
 impl State{
@@ -254,7 +262,11 @@ impl State{
         );
         let num_indices = INDICES.len() as u32;
 
-        //实例化绘制
+        //初始化游戏
+        let mut board = initialize_board();
+        let value = &board;
+
+        //实例化绘制初始化
         let instances = (0..NUM_INSTANCES_PER_ROW).flat_map(|y| {
             (0..NUM_INSTANCES_PER_ROW).map(move |x| {
                 let position = cgmath::Vector3 {
@@ -263,7 +275,11 @@ impl State{
                     z: 0.00,
                 } - INSTANCE_DISPLACEMENT;
 
-                let position = position * 0.1;
+                let mut position = position * 0.1;
+
+                if !value[x as usize][y as usize] {
+                    position = position * 1000.0;
+                }
 
                 let rotation = if position.is_zero() {
                     // 需要这行特殊处理，这样在 (0, 0, 0) 的物体不会被缩放到 0
@@ -274,7 +290,8 @@ impl State{
                 };
 
                 Instance {
-                    position, rotation,
+                    position,
+                    rotation,
                 }
             })
         }).collect::<Vec<_>>();
@@ -289,6 +306,12 @@ impl State{
             }
         );
 
+        //延时
+        let last_update = Instant::now();
+
+        //初始化控制
+        let mouse_position = None;
+
         State{
             surface,
             device,
@@ -301,6 +324,9 @@ impl State{
             num_indices,
             instances,
             instance_buffer,
+            board,
+            last_update,
+            mouse_position,
         }
     }
 
@@ -328,8 +354,31 @@ impl State{
     }
 
     fn input(&mut self,event: &WindowEvent) -> bool {
+        match event {
+            WindowEvent::CursorMoved { position, .. } => {
+                self.mouse_position = Some(*position);
+            }
+            WindowEvent::MouseInput { button, state, .. } => {
+                if *button == MouseButton::Left && *state == ElementState::Pressed {
+                    if let Some(position) = self.mouse_position {
+                        self.place_cell(position.x as f32, position.y as f32);
+                    }
+                }
+            }
+            _ => {}
+        }
         false
     }
+
+    fn place_cell(&mut self, x: f32, y: f32) {
+        let cell_size = self.size.width as f32 / NUM_INSTANCES_PER_ROW as f32;
+        let cell_x = (x / cell_size) as usize;
+        let cell_y = (y / cell_size) as usize;
+        if cell_x < NUM_INSTANCES_PER_ROW as usize && cell_y < NUM_INSTANCES_PER_ROW as usize {
+            self.board[cell_x][cell_y] = true;
+        }
+    }
+
 
     fn update(&mut self){
 
@@ -359,6 +408,58 @@ impl State{
                 }],
                 depth_stencil_attachment: None,
             });
+
+            //限制刷新频率
+            let now = Instant::now();
+            let elapsed = now.duration_since(self.last_update);
+            if elapsed >= Duration::new(0, 200_000_000) {
+                self.board = update_board(&self.board);
+                self.last_update = now;
+            } else {
+                thread::sleep(Duration::new(0, 200_000_000) - elapsed);
+            }
+
+            let board_ref = &self.board;
+
+            let instances = (0..NUM_INSTANCES_PER_ROW).flat_map(move|y| {
+                (0..NUM_INSTANCES_PER_ROW).map(move|x| {
+                    let position = cgmath::Vector3 {
+                        x: x as f32 + 0.5,
+                        y: y as f32 + 0.5,
+                        z: 0.00,
+                    } - INSTANCE_DISPLACEMENT;
+
+                    let mut position = position * 0.1;
+
+                    if !board_ref[x as usize][y as usize] {
+                        position = position * 1000.0;
+                    }
+
+                    let rotation = if position.is_zero() {
+                        // 需要这行特殊处理，这样在 (0, 0, 0) 的物体不会被缩放到 0
+                        // 因为错误的四元数会影响到缩放
+                        cgmath::Quaternion::from_axis_angle(cgmath::Vector3::unit_z(), cgmath::Deg(0.0))
+                    } else {
+                        cgmath::Quaternion::from_axis_angle(position.normalize(), cgmath::Deg(0.0))
+                    };
+
+                    Instance {
+                        position,
+                        rotation,
+                    }
+                })
+            }).collect::<Vec<_>>();
+
+            let instance_data = instances.iter().map(Instance::to_raw).collect::<Vec<_>>();
+            let instance_buffer = self.device.create_buffer_init(
+                &util::BufferInitDescriptor {
+                    label: Some("Instance Buffer"),
+                    contents: bytemuck::cast_slice(&instance_data),
+                    usage: BufferUsages::VERTEX,
+                }
+            );
+            self.instances = instances;
+            self.instance_buffer = instance_buffer;
 
             //着色器绑定部分
             render_pass.set_pipeline(&self.render_pipeline);
@@ -437,4 +538,59 @@ fn main() {
         }
         _ => {}
     });
+}
+
+////实现细胞格子计算
+//初始化棋盘
+fn initialize_board() -> Vec<Vec<bool>> {
+    let mut board = vec![vec![false; NUM_INSTANCES_PER_ROW as usize]; NUM_INSTANCES_PER_ROW as usize];
+    for i in 0..NUM_INSTANCES_PER_ROW as usize {
+        for j in 0..NUM_INSTANCES_PER_ROW as usize {
+            board[i][j] = rand::random::<bool>(); // 随机填充
+        }
+    }
+    board
+}
+// 计算一个细胞周围活细胞的数量
+fn count_neighbors(board: &Vec<Vec<bool>>, x: usize, y: usize) -> usize {
+    let mut count = 0;
+    for i in -1..=1 {
+        for j in -1..=1 {
+            if i == 0 && j == 0 {
+                continue;
+            }
+            let nx = x as isize + i;
+            let ny = y as isize + j;
+            if nx >= 0 && ny >= 0 && nx < NUM_INSTANCES_PER_ROW as isize && ny < NUM_INSTANCES_PER_ROW as isize {
+                if board[nx as usize][ny as usize] {
+                    count += 1;
+                }
+            }
+        }
+    }
+    count
+}
+
+// 更新棋盘的状态
+fn update_board(board: &Vec<Vec<bool>>) -> Vec<Vec<bool>> {
+    let mut new_board = vec![vec![false; NUM_INSTANCES_PER_ROW as usize]; NUM_INSTANCES_PER_ROW as usize];
+
+    for i in 0..NUM_INSTANCES_PER_ROW as usize {
+        for j in 0..NUM_INSTANCES_PER_ROW as usize {
+            let neighbors = count_neighbors(board, i, j);
+            if board[i][j] {
+                // 如果当前细胞是活的
+                if neighbors == 2 || neighbors == 3 {
+                    new_board[i][j] = true; // 继续存活
+                }
+            } else {
+                // 如果当前细胞是死的
+                if neighbors == 3 {
+                    new_board[i][j] = true; // 复活
+                }
+            }
+        }
+    }
+
+    new_board
 }
