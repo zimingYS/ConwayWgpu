@@ -5,6 +5,9 @@
 ////如果此项目涉及侵权，请联系作者或在讨论中提出
 ////仅作学习探讨使用
 
+use std::thread;
+use std::time::{Duration, Instant};
+use cgmath::{InnerSpace, Rotation3, Zero};
 use winit::{
     event::*,
     event_loop::{ControlFlow, EventLoop},
@@ -12,7 +15,118 @@ use winit::{
 };
 
 use wgpu::*;
+use wgpu::util::DeviceExt;
 use winit::window::Window;
+
+//创建顶点
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct Vertex {
+    position: [f32; 3],
+    color: [f32; 3],
+}
+
+const VERTICES: &[Vertex] = &[
+    Vertex { position: [-0.05,  0.05, 0.00], color: [1.0, 1.0, 1.0] },
+    Vertex { position: [-0.05, -0.05, 0.00], color: [1.0, 1.0, 1.0] },
+    Vertex { position: [ 0.05, -0.05, 0.00], color: [1.0, 1.0, 1.0] },
+    Vertex { position: [ 0.05,  0.05, 0.00], color: [1.0, 1.0, 1.0] },
+];
+
+const INDICES: &[u16] = &[
+    0,1,2,
+    0,2,3,
+];
+
+impl Vertex {
+    fn desc<'a>() -> VertexBufferLayout<'a> {
+        VertexBufferLayout {
+            array_stride: size_of::<Vertex>() as BufferAddress,
+            step_mode: VertexStepMode::Vertex,
+            attributes: &[
+                VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: VertexFormat::Float32x3,
+                },
+                VertexAttribute {
+                    offset: size_of::<[f32; 3]>() as BufferAddress,
+                    shader_location: 1,
+                    format: VertexFormat::Float32x3,
+                }
+            ]
+        }
+    }
+}
+
+
+
+
+////实例化缓冲区
+//定义实例化大小
+const NUM_INSTANCES_PER_ROW: u32 = 20;
+const INSTANCE_DISPLACEMENT: cgmath::Vector3<f32> = cgmath::Vector3::new(
+    NUM_INSTANCES_PER_ROW as f32 * 0.5,
+    NUM_INSTANCES_PER_ROW as f32 * 0.5,
+    0.00);
+
+struct Instance {
+    position: cgmath::Vector3<f32>,
+    rotation: cgmath::Quaternion<f32>,
+}
+
+impl Instance {
+    fn to_raw(&self) -> InstanceRaw {
+        InstanceRaw {
+            model: (cgmath::Matrix4::from_translation(self.position) * cgmath::Matrix4::from(self.rotation)).into(),
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct InstanceRaw {
+    model: [[f32; 4]; 4],
+}
+
+impl InstanceRaw {
+    fn desc<'a>() -> VertexBufferLayout<'a> {
+        use std::mem;
+        VertexBufferLayout {
+            array_stride: size_of::<InstanceRaw>() as BufferAddress,
+            // 我们需要从把 Vertex 的 step mode 切换为 Instance
+            // 这样着色器只有在开始处理一次新实例化绘制时，才会接受下一份实例
+            step_mode: VertexStepMode::Instance,
+            attributes: &[
+                VertexAttribute {
+                    offset: 0,
+                    // 虽然顶点着色器现在只使用位置 0 和 1，但在后面的教程中，我们将对 Vertex 使用位置 2、3 和 4
+                    // 因此我们将从 5 号 slot 开始，以免在后面导致冲突
+                    shader_location: 5,
+                    format: VertexFormat::Float32x4,
+                },
+                // 一个 mat4 需要占用 4 个顶点 slot，因为严格来说它是 4 个vec4
+                // 我们需要为每个 vec4 定义一个 slot，并在着色器中重新组装出 mat4
+                VertexAttribute {
+                    offset: size_of::<[f32; 4]>() as BufferAddress,
+                    shader_location: 6,
+                    format: VertexFormat::Float32x4,
+                },
+                VertexAttribute {
+                    offset: size_of::<[f32; 8]>() as BufferAddress,
+                    shader_location: 7,
+                    format: VertexFormat::Float32x4,
+                },
+                VertexAttribute {
+                    offset: size_of::<[f32; 12]>() as BufferAddress,
+                    shader_location: 8,
+                    format: VertexFormat::Float32x4,
+                },
+            ],
+        }
+    }
+}
+
 
 struct State{
     //初始化部分
@@ -24,6 +138,20 @@ struct State{
     size: winit::dpi::PhysicalSize<u32>,
     //着色器
     render_pipeline: RenderPipeline,
+    //顶点
+    vertex_buffer: Buffer,
+    //索引
+    index_buffer: Buffer,
+    num_indices: u32,
+    //实例化
+    instances: Vec<Instance>,
+    instance_buffer: Buffer,
+    //游戏状态更新
+    board: Vec<Vec<bool>>,
+    //更新延时
+    last_update: Instant,
+    //控制设置
+    mouse_position: Option<winit::dpi::PhysicalPosition<f64>>,
 }
 //用于处理一些操作
 impl State{
@@ -32,7 +160,7 @@ impl State{
         let size = window.inner_size();
 
     ////初始化窗口设置
-        let instance = Instance::new(Backends::all());
+        let instance = wgpu::Instance::new(Backends::all());
         let surface = unsafe {instance.create_surface(window)};
         let adapter = instance.request_adapter(
             &RequestAdapterOptions{
@@ -80,7 +208,10 @@ impl State{
             vertex: VertexState {
                 module: &shader,
                 entry_point: "vs_main", // 1.
-                buffers: &[], // 2.
+                buffers: &[
+                    Vertex::desc(),
+                    InstanceRaw::desc(),
+                ], // 2.
             },
             fragment: Some(FragmentState { // 3.
                 module: &shader,
@@ -112,6 +243,75 @@ impl State{
             multiview: None, // 5.
         });
 
+        //顶点缓冲区
+        let vertex_buffer = device.create_buffer_init(
+            &util::BufferInitDescriptor {
+                label: Some("Vertex Buffer"),
+                contents: bytemuck::cast_slice(VERTICES),
+                usage: BufferUsages::VERTEX,
+            }
+        );
+
+        //索引
+        let index_buffer = device.create_buffer_init(
+            &util::BufferInitDescriptor {
+                label: Some("Index Buffer"),
+                contents: bytemuck::cast_slice(INDICES),
+                usage: BufferUsages::INDEX,
+            }
+        );
+        let num_indices = INDICES.len() as u32;
+
+        //初始化游戏
+        let mut board = initialize_board();
+        let value = &board;
+
+        //实例化绘制初始化
+        let instances = (0..NUM_INSTANCES_PER_ROW).flat_map(|y| {
+            (0..NUM_INSTANCES_PER_ROW).map(move |x| {
+                let position = cgmath::Vector3 {
+                    x: x as f32 + 0.5,
+                    y: y as f32 + 0.5,
+                    z: 0.00,
+                } - INSTANCE_DISPLACEMENT;
+
+                let mut position = position * 0.1;
+
+                if !value[x as usize][y as usize] {
+                    position = position * 1000.0;
+                }
+
+                let rotation = if position.is_zero() {
+                    // 需要这行特殊处理，这样在 (0, 0, 0) 的物体不会被缩放到 0
+                    // 因为错误的四元数会影响到缩放
+                    cgmath::Quaternion::from_axis_angle(cgmath::Vector3::unit_z(), cgmath::Deg(0.0))
+                } else {
+                    cgmath::Quaternion::from_axis_angle(position.normalize(), cgmath::Deg(0.0))
+                };
+
+                Instance {
+                    position,
+                    rotation,
+                }
+            })
+        }).collect::<Vec<_>>();
+
+        //实例化缓冲
+        let instance_data = instances.iter().map(Instance::to_raw).collect::<Vec<_>>();
+        let instance_buffer = device.create_buffer_init(
+            &util::BufferInitDescriptor {
+                label: Some("Instance Buffer"),
+                contents: bytemuck::cast_slice(&instance_data),
+                usage: BufferUsages::VERTEX,
+            }
+        );
+
+        //延时
+        let last_update = Instant::now();
+
+        //初始化控制
+        let mouse_position = None;
+
         State{
             surface,
             device,
@@ -119,6 +319,14 @@ impl State{
             config,
             size,
             render_pipeline,
+            vertex_buffer,
+            index_buffer,
+            num_indices,
+            instances,
+            instance_buffer,
+            board,
+            last_update,
+            mouse_position,
         }
     }
 
@@ -146,8 +354,31 @@ impl State{
     }
 
     fn input(&mut self,event: &WindowEvent) -> bool {
+        match event {
+            WindowEvent::CursorMoved { position, .. } => {
+                self.mouse_position = Some(*position);
+            }
+            WindowEvent::MouseInput { button, state, .. } => {
+                if *button == MouseButton::Left && *state == ElementState::Pressed {
+                    if let Some(position) = self.mouse_position {
+                        self.place_cell(position.x as f32, position.y as f32);
+                    }
+                }
+            }
+            _ => {}
+        }
         false
     }
+
+    fn place_cell(&mut self, x: f32, y: f32) {
+        let cell_size = self.size.width as f32 / NUM_INSTANCES_PER_ROW as f32;
+        let cell_x = (x / cell_size) as usize;
+        let cell_y = (y / cell_size) as usize;
+        if cell_x < NUM_INSTANCES_PER_ROW as usize && cell_y < NUM_INSTANCES_PER_ROW as usize {
+            self.board[cell_x][cell_y] = true;
+        }
+    }
+
 
     fn update(&mut self){
 
@@ -178,9 +409,67 @@ impl State{
                 depth_stencil_attachment: None,
             });
 
+            //限制刷新频率
+            let now = Instant::now();
+            let elapsed = now.duration_since(self.last_update);
+            if elapsed >= Duration::new(0, 200_000_000) {
+                self.board = update_board(&self.board);
+                self.last_update = now;
+            } else {
+                thread::sleep(Duration::new(0, 200_000_000) - elapsed);
+            }
+
+            let board_ref = &self.board;
+
+            let instances = (0..NUM_INSTANCES_PER_ROW).flat_map(move|y| {
+                (0..NUM_INSTANCES_PER_ROW).map(move|x| {
+                    let position = cgmath::Vector3 {
+                        x: x as f32 + 0.5,
+                        y: y as f32 + 0.5,
+                        z: 0.00,
+                    } - INSTANCE_DISPLACEMENT;
+
+                    let mut position = position * 0.1;
+
+                    if !board_ref[x as usize][y as usize] {
+                        position = position * 1000.0;
+                    }
+
+                    let rotation = if position.is_zero() {
+                        // 需要这行特殊处理，这样在 (0, 0, 0) 的物体不会被缩放到 0
+                        // 因为错误的四元数会影响到缩放
+                        cgmath::Quaternion::from_axis_angle(cgmath::Vector3::unit_z(), cgmath::Deg(0.0))
+                    } else {
+                        cgmath::Quaternion::from_axis_angle(position.normalize(), cgmath::Deg(0.0))
+                    };
+
+                    Instance {
+                        position,
+                        rotation,
+                    }
+                })
+            }).collect::<Vec<_>>();
+
+            let instance_data = instances.iter().map(Instance::to_raw).collect::<Vec<_>>();
+            let instance_buffer = self.device.create_buffer_init(
+                &util::BufferInitDescriptor {
+                    label: Some("Instance Buffer"),
+                    contents: bytemuck::cast_slice(&instance_data),
+                    usage: BufferUsages::VERTEX,
+                }
+            );
+            self.instances = instances;
+            self.instance_buffer = instance_buffer;
+
             //着色器绑定部分
             render_pass.set_pipeline(&self.render_pipeline);
-            render_pass.draw(0..3, 0..1);
+            //顶点设置
+            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
+            //索引设置
+            render_pass.set_index_buffer(self.index_buffer.slice(..), IndexFormat::Uint16);
+            //绘制
+            render_pass.draw_indexed(0..self.num_indices, 0, 0..self.instances.len() as _);
         }
 
         // submit 方法能传入任何实现了 IntoIter 的参数
@@ -249,4 +538,59 @@ fn main() {
         }
         _ => {}
     });
+}
+
+////实现细胞格子计算
+//初始化棋盘
+fn initialize_board() -> Vec<Vec<bool>> {
+    let mut board = vec![vec![false; NUM_INSTANCES_PER_ROW as usize]; NUM_INSTANCES_PER_ROW as usize];
+    for i in 0..NUM_INSTANCES_PER_ROW as usize {
+        for j in 0..NUM_INSTANCES_PER_ROW as usize {
+            board[i][j] = rand::random::<bool>(); // 随机填充
+        }
+    }
+    board
+}
+// 计算一个细胞周围活细胞的数量
+fn count_neighbors(board: &Vec<Vec<bool>>, x: usize, y: usize) -> usize {
+    let mut count = 0;
+    for i in -1..=1 {
+        for j in -1..=1 {
+            if i == 0 && j == 0 {
+                continue;
+            }
+            let nx = x as isize + i;
+            let ny = y as isize + j;
+            if nx >= 0 && ny >= 0 && nx < NUM_INSTANCES_PER_ROW as isize && ny < NUM_INSTANCES_PER_ROW as isize {
+                if board[nx as usize][ny as usize] {
+                    count += 1;
+                }
+            }
+        }
+    }
+    count
+}
+
+// 更新棋盘的状态
+fn update_board(board: &Vec<Vec<bool>>) -> Vec<Vec<bool>> {
+    let mut new_board = vec![vec![false; NUM_INSTANCES_PER_ROW as usize]; NUM_INSTANCES_PER_ROW as usize];
+
+    for i in 0..NUM_INSTANCES_PER_ROW as usize {
+        for j in 0..NUM_INSTANCES_PER_ROW as usize {
+            let neighbors = count_neighbors(board, i, j);
+            if board[i][j] {
+                // 如果当前细胞是活的
+                if neighbors == 2 || neighbors == 3 {
+                    new_board[i][j] = true; // 继续存活
+                }
+            } else {
+                // 如果当前细胞是死的
+                if neighbors == 3 {
+                    new_board[i][j] = true; // 复活
+                }
+            }
+        }
+    }
+
+    new_board
 }
