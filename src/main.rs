@@ -5,6 +5,43 @@
 ////如果此项目涉及侵权，请联系作者或在讨论中提出
 ////仅作学习探讨使用
 
+
+
+//创建顶点
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct Vertex {
+    position: [f32; 3],
+    color: [f32; 3],
+}
+
+const VERTICES: &[Vertex] = &[
+    Vertex { position: [0.0, 0.5, 0.0], color: [1.0, 0.0, 0.0] },
+    Vertex { position: [-0.5, -0.5, 0.0], color: [0.0, 1.0, 0.0] },
+    Vertex { position: [0.5, -0.5, 0.0], color: [0.0, 0.0, 1.0] },
+];
+
+impl Vertex {
+    fn desc<'a>() -> VertexBufferLayout<'a> {
+        VertexBufferLayout {
+            array_stride: size_of::<Vertex>() as BufferAddress,
+            step_mode: VertexStepMode::Vertex,
+            attributes: &[
+                VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: VertexFormat::Float32x3,
+                },
+                VertexAttribute {
+                    offset: size_of::<[f32; 3]>() as BufferAddress,
+                    shader_location: 1,
+                    format: VertexFormat::Float32x3,
+                }
+            ]
+        }
+    }
+}
+
 use winit::{
     event::*,
     event_loop::{ControlFlow, EventLoop},
@@ -12,6 +49,7 @@ use winit::{
 };
 
 use wgpu::*;
+use wgpu::util::DeviceExt;
 use winit::window::Window;
 
 struct State{
@@ -24,6 +62,9 @@ struct State{
     size: winit::dpi::PhysicalSize<u32>,
     //着色器
     render_pipeline: RenderPipeline,
+    //顶点
+    vertex_buffer: Buffer,
+    num_vertices: u32,
 }
 //用于处理一些操作
 impl State{
@@ -80,7 +121,9 @@ impl State{
             vertex: VertexState {
                 module: &shader,
                 entry_point: "vs_main", // 1.
-                buffers: &[], // 2.
+                buffers: &[
+                    Vertex::desc(),
+                ], // 2.
             },
             fragment: Some(FragmentState { // 3.
                 module: &shader,
@@ -112,6 +155,18 @@ impl State{
             multiview: None, // 5.
         });
 
+        //顶点缓冲区
+        let vertex_buffer = device.create_buffer_init(
+            &util::BufferInitDescriptor {
+                label: Some("Vertex Buffer"),
+                contents: bytemuck::cast_slice(VERTICES),
+                usage: BufferUsages::VERTEX,
+            }
+        );
+
+        //顶点计数
+        let num_vertices = VERTICES.len() as u32;
+
         State{
             surface,
             device,
@@ -119,6 +174,8 @@ impl State{
             config,
             size,
             render_pipeline,
+            vertex_buffer,
+            num_vertices,
         }
     }
 
@@ -180,7 +237,9 @@ impl State{
 
             //着色器绑定部分
             render_pass.set_pipeline(&self.render_pipeline);
-            render_pass.draw(0..3, 0..1);
+            //顶点绘制
+            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            render_pass.draw(0..self.num_vertices, 0..1);
         }
 
         // submit 方法能传入任何实现了 IntoIter 的参数
